@@ -250,7 +250,7 @@ check_prefix() {
         return 1
     fi
 
-    # octal file access permissions
+    # file access permissions
     permissions=$(stat --format=%a "$prefix")
     if [ "$permissions" != 700 ]; then
         >&2 echo "--prefix must have permissions mask 700, but $prefix has $permissions."

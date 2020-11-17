@@ -1,10 +1,13 @@
 
-MAKE_PID := $(shell ps -o ppid= -p $$$)
+APTCENTRAL := ./aptcentral --prefix $(shell realpath scratch)
 
-foo: bar
-	echo "The make PID is $(MAKE_PID)"
-	echo "made foo from bar"
-	touch foo
+# try-start and try-stop could be better than the "|| true" hack.
 
-.PHONY: bar
-	echo "making bar"
+burger: | /usr/games/cowsay
+	cowsay "please don't eat me"
+	touch burger
+	$(APTCENTRAL) stop 2>/dev/null || true
+
+/usr/games/cowsay:
+	sudo $(APTCENTRAL) start 2>/dev/null || true
+	$(APTCENTRAL) install cowsay

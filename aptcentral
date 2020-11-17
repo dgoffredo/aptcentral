@@ -1,0 +1,251 @@
+#!/bin/sh
+
+usage() {
+    cat <<END_USAGE
+aptcentral - centralized agent for running "apt" commands
+
+Usage:
+    sudo $0 --start-daemon
+    sudo $0 --stop-daemon
+    $0 install PACKAGE [ PACKAGES ... ]
+
+When invoked with the "--start-daemon" option, aptcentral spawns a
+background process that reads commands from a pipe. Invocations using the
+"--start-daemon" option must run as root.
+
+When invoked with the "--stop-daemon" option, aptcentral sends a command to
+the daemon telling it to terminate. Invocations using the "--stop-daemon"
+option must run as root.
+
+Otherwise, aptcentral is a command line client to the daemon. The first
+argument is the "apt" command to run. Only "install" is supported. The rest
+of the arguments are the names of the packages to install. The "install"
+command is executed as if the "-y" flag were specified.
+END_USAGE
+}
+
+check_install_args() {
+    if [ "$1" != "install" ]; then
+        >&2 echo "Unsupported command \"$1\". Only \"install\" is supported."
+        return 1
+    fi
+
+    shift
+    for package in "$@"; do
+        case "$package" in
+        -*)
+            >&2 echo "Invalid package name \"$package\" starts with a hyphen."
+            return 1 ;;
+        *" "*)
+            >&2 echo "Invalid package name \"$package\" contains a hyphen."
+            return 1 ;;
+        esac
+    done
+}
+
+check_solo_flag_args() {
+    flag="$1"
+    shift
+    if [ "$#" -ne 0 ]; then
+        >&2 echo "$flag option must appear alone."
+        >&2 echo "Instead, received additional arguments: $@"
+        return 1
+    fi
+}
+
+# sprinkler PIPE FILE [ FILES ... ] &
+#
+# Read from the specified pipe and "tee --append" the contents of the pipe to
+# the specified files.
+#
+# This function is meant to be run as a background process.
+sprinkler() {
+    # Ignore signals that might be sent when our process group leader exits.
+    trap "" SIGHUP SIGINT
+
+    pipe="$1"
+    shift # so now "$@" is the output files
+
+    # While the pipe exists, tee it to the output files in append mode.
+    while true; do
+        # The "tee" command is executed in a subshell, so that if "$pipe" no
+        # longer exists and bash reports an error, we can discard the error
+        # message and exit cleanly, i.e. the pipe not existing is the graceful
+        # shutdown. This avoids a race between checking for the existence of the
+        # pipe and trying to use it.
+        (<"$pipe" >/dev/null tee --append "$@") 2>/dev/null || break
+    done
+}
+
+# daemon &
+#
+# Execute the main loop of an aptcentral daemon. This function assumes the existence of
+# the following named pipes:
+#
+# - /var/run/aptcentral/stdout 
+# - /var/run/aptcentral/stderr
+#
+# and of the following directories:
+#
+# - /var/run/aptcentral/
+# - /var/log/aptcentral/
+#
+# This function is meant to be run as a background process, and with elevated
+# privileges -- those needed to run "apt install" commands (e.g. run as root
+# via sudo).
+daemon() {
+    # Ignore signals that might be sent when our process group leader exits.
+    trap "" SIGHUP SIGINT
+
+    # Create "tee" child processes that drain the "stdout" and "stderr" pipes
+    # into the appropriate log files.
+    # These "sprinklers" will exit after their input pipes are removed.
+    #
+    # The point of the sprinklers is to have separate log files for stdout and
+    # stderr, but also to have a combined log file with both. Note that
+    # because stdout and stderr are managed by separate processes, lines in
+    # the combined file could appear out of order.
+    sprinkler /var/run/aptcentral/stdout \
+        /var/log/aptcentral/daemon.stdout.log \
+        /var/log/aptcentral/daemon.log &
+
+    sprinkler /var/run/aptcentral/stderr \
+        /var/log/aptcentral/daemon.stderr.log \
+        /var/log/aptcentral/daemon.log &
+
+    # Now that the sprinklers are set up, we can redirect output to the pipes.
+    exec >/var/run/aptcentral/stdout
+    exec 2>/var/run/aptcentral/stderr
+
+    # Process commands from the command pipe.
+    while true; do
+        while read -r stdout_pipe stderr_pipe status_pipe command args; do
+            case $command in
+            exit)
+                exit_stdout_pipe="$stdout_pipe"
+                exit_stderr_pipe="$stderr_pipe"
+                exit_status_pipe="$status_pipe"
+                echo "exiting...";
+                break 2 ;; # break out of the outer loop
+            install)
+                # TODO: Validate args, stdout_pipe, stderr_pipe. Otherwise we
+                # allow command injection as root. Anyone can send us a
+                # command...
+                # TODO: Oh man there's no way to make this safe.
+                >"$stdout_pipe" 2>"$stderr_pipe" apt-get install -y $args
+                >"$status_pipe" printf "$?" ;;
+            *)
+                echo "aptcentral daemon received invalid command: $command $args" ;;
+            esac
+        done </var/run/aptcentral/command
+    done
+
+    # Remove our pipes.
+    rm /var/run/aptcentral/command
+    # Removing the stdout and stderr pipes is a little trickier, because we
+    # want to first rm the pipe and then close it to wake up the sprinkler.
+    # Since our stdout and stderr are tied to the pipes, that means we have to
+    # close our stdout and stderr. Let's redirect them to the output pipes of
+    # the "exit" command that got us here.
+    rm /var/run/aptcentral/stdout
+    exec >"$stdout_pipe"
+    rm /var/run/aptcentral/stderr
+    exec 2>"$stderr_pipe"
+
+    wait # wait for the sprinklers to terminate
+
+    # Notify the client who sent us "exit" that we're done (zero → success).
+    >"$exit_status_pipe" printf "0"
+}
+
+start_daemon() {
+    # Make sure that we have elevated permissions.
+    if [ "$(id -u)" -ne 0 ]; then
+        >&2 echo "aptcentral --start-daemon must run as root, e.g. using sudo"
+        return 1
+    fi
+
+    # If the command pipe is already there, then something is or was wrong.
+    if [ -p /var/run/aptcentral/command ]; then
+        >&2 cat <<-END_ERROR
+		The /var/run/aptcentral/command pipe already exists. Either
+		aptcentral --start-daemon is already running, or a previous instance of
+		the daemon did not remove the pipe before exiting.
+
+		If you're sure that aptcentral --start-daemon is not running, then 'sudo
+		rm /var/run/aptcentral/command' and try again.
+		END_ERROR
+        return 2
+    fi
+
+    mkdir -p /var/run/aptcentral # for pipes
+    mkdir -p /var/log/aptcentral # for logs
+
+    # for communicating with clients
+    mkfifo --mode=666 /var/run/aptcentral/command
+
+    # The daemon will redirect its stdout and stderr to these pipes, after
+    # first spawning child processes that tee the pipes into various logs.
+    if ! [ -p /var/run/aptcentral/stdout ]; then
+        mkfifo /var/run/aptcentral/stdout # for logging
+    fi
+    if ! [ -p /var/run/aptcentral/stderr ]; then
+        mkfifo /var/run/aptcentral/stderr # for logging
+    fi
+
+    </dev/null >/dev/null 2>/dev/null daemon &
+}
+
+send_command() {
+    if ! [ -p /var/run/aptcentral/command ]; then
+        >&2 echo "There's no pipe at /var/run/aptcentral/command."
+        return 1
+    fi
+
+    # Create a temporary directory for pipes.
+    workspace=$(mktemp -d)
+    mkfifo $workspace/stdout 
+    mkfifo $workspace/stderr
+    mkfifo $workspace/status
+
+    >/var/run/aptcentral/command echo \
+        "$workspace/stdout $workspace/stderr $workspace/status $@"
+
+    cat $workspace/stdout &
+    >&2 cat $workspace/stderr &
+    status="$(cat $workspace/status)"
+
+    wait
+    rm -r $workspace
+    return "$status"
+}
+
+stop_daemon() {
+    send_command exit
+}
+
+install() {
+    send_command install "$@"
+}
+
+case "$1" in
+-h|--help)
+    usage
+    exit ;;
+--start-daemon)
+    check_solo_flag_args "$@" || exit
+    start_daemon || exit ;;
+--stop-daemon)
+    # TODO: use a different, root-only, pipe for stopping
+    check_solo_flag_args "$@" || exit
+    stop_daemon || exit ;;
+install)
+    check_install_args "$@" || exit
+    shift
+    install "$@" || exit ;;
+*)
+    >&2 usage
+    >&2 echo
+    >&2 echo "Invalid argument(s): $@"
+    exit 1 ;;
+esac

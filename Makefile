@@ -1,7 +1,10 @@
 
 MAKE_PID := $(shell ps -o ppid= -p $$$)
-TRY_IT := $(shell echo >&2 'Do a thing.'; sudo sleep 10)
 
-.PHONY: all
-all:
+foo: bar
 	echo "The make PID is $(MAKE_PID)"
+	echo "made foo from bar"
+	touch foo
+
+.PHONY: bar
+	echo "making bar"

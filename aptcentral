@@ -9,11 +9,13 @@ Usage:
     $0 --prefix PREFIX stop
     $0 --prefix PREFIX install PACKAGE [ PACKAGES ... ]
     $0 --prefix PREFIX remove PACKAGE [ PACKAGES ... ]
+    $0 --prefix PREFIX update
 
 'start' starts the daemon.
 'stop' stops the daemon.
 'install' tells the daemon to 'apt-get install -y ...'.
 'remove' tells the daemon to 'apt-get remove -y ...'.
+'update' tells the daemon to 'apt-get update'.
 
 '--prefix PREFIX' is required, and must be an absolute path to a directory
 whose access permissions mask is 700.
@@ -34,11 +36,11 @@ check_package_args() {
     done
 }
 
-check_solo_flag_args() {
+check_solo_arg() {
     flag="$1"
     shift
     if [ "$#" -ne 0 ]; then
-        >&2 echo "$flag option must appear alone."
+        >&2 echo "$flag parameter must appear alone."
         >&2 echo "Instead, received additional arguments: $@"
         return 1
     fi
@@ -94,7 +96,7 @@ daemon() {
     # The point of the sprinklers is to have separate log files for stdout and
     # stderr, but also to have a combined log file with both. Note that
     # because stdout and stderr are managed by separate processes, lines in
-    # the combined file could appear out of order.
+    # the combined file could appear out of order. But I bet they won't.
     sprinkler $prefix/var/run/aptcentral/stdout \
         $prefix/var/log/aptcentral/daemon.stdout.log \
         $prefix/var/log/aptcentral/daemon.log &
@@ -126,6 +128,10 @@ daemon() {
             remove)
                 # See the note about safety, above.
                 >"$stdout_pipe" 2>"$stderr_pipe" apt-get remove -y $args
+                >"$status_pipe" printf "$?" ;;
+            update)
+                # See the note about safety, above.
+                >"$stdout_pipe" 2>"$stderr_pipe" apt-get update -y
                 >"$status_pipe" printf "$?" ;;
             *)
                 echo "aptcentral daemon received invalid command: $command $args" ;;
@@ -263,12 +269,12 @@ while true; do
         prefix="$2"
         shift 2 ;;
     start)
-        check_solo_flag_args "$@" || exit
+        check_solo_arg "$@" || exit
         check_prefix || exit
         start_daemon
         exit ;;
     stop)
-        check_solo_flag_args "$@" || exit
+        check_solo_arg "$@" || exit
         check_prefix || exit
         stop_daemon
         exit ;;
@@ -283,6 +289,11 @@ while true; do
         check_package_args "$@" || exit
         check_prefix || exit
         send_command remove "$@"
+        exit ;;
+    update)
+        check_solo_arg "$@" || exit
+        check_prefix || exit
+        send_command update
         exit ;;
     *)
         >&2 usage

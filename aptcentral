@@ -5,40 +5,31 @@ usage() {
 aptcentral - centralized agent for running "apt" commands
 
 Usage:
-    sudo $0 --start-daemon
-    sudo $0 --stop-daemon
-    $0 install PACKAGE [ PACKAGES ... ]
+    sudo $0 --prefix PREFIX start
+    $0 --prefix PREFIX stop
+    $0 --prefix PREFIX install PACKAGE [ PACKAGES ... ]
+    $0 --prefix PREFIX remove PACKAGE [ PACKAGES ... ]
 
-When invoked with the "--start-daemon" option, aptcentral spawns a
-background process that reads commands from a pipe. Invocations using the
-"--start-daemon" option must run as root.
+'start' starts the daemon.
+'stop' stops the daemon.
+'install' tells the daemon to 'apt-get install -y ...'.
+'remove' tells the daemon to 'apt-get remove -y ...'.
 
-When invoked with the "--stop-daemon" option, aptcentral sends a command to
-the daemon telling it to terminate. Invocations using the "--stop-daemon"
-option must run as root.
-
-Otherwise, aptcentral is a command line client to the daemon. The first
-argument is the "apt" command to run. Only "install" is supported. The rest
-of the arguments are the names of the packages to install. The "install"
-command is executed as if the "-y" flag were specified.
+'--prefix PREFIX' is required, and must be an absolute path to a directory
+whose access permissions mask is 700.
 END_USAGE
 }
 
-check_install_args() {
-    if [ "$1" != "install" ]; then
-        >&2 echo "Unsupported command \"$1\". Only \"install\" is supported."
-        return 1
-    fi
-
-    shift
+check_package_args() {
     for package in "$@"; do
         case "$package" in
         -*)
             >&2 echo "Invalid package name \"$package\" starts with a hyphen."
             return 1 ;;
         *" "*)
-            >&2 echo "Invalid package name \"$package\" contains a hyphen."
+            >&2 echo "Invalid package name \"$package\" contains a space."
             return 1 ;;
+        *) ;;
         esac
     done
 }
@@ -82,17 +73,16 @@ sprinkler() {
 # Execute the main loop of an aptcentral daemon. This function assumes the existence of
 # the following named pipes:
 #
-# - /var/run/aptcentral/stdout 
-# - /var/run/aptcentral/stderr
+# - $prefix/var/run/aptcentral/stdout 
+# - $prefix/var/run/aptcentral/stderr
 #
 # and of the following directories:
 #
-# - /var/run/aptcentral/
-# - /var/log/aptcentral/
+# - $prefix/var/run/aptcentral/
+# - $prefix/var/log/aptcentral/
 #
 # This function is meant to be run as a background process, and with elevated
-# privileges -- those needed to run "apt install" commands (e.g. run as root
-# via sudo).
+# privileges -- those needed to run "apt-get" commands.
 daemon() {
     # Ignore signals that might be sent when our process group leader exits.
     trap "" SIGHUP SIGINT
@@ -105,17 +95,17 @@ daemon() {
     # stderr, but also to have a combined log file with both. Note that
     # because stdout and stderr are managed by separate processes, lines in
     # the combined file could appear out of order.
-    sprinkler /var/run/aptcentral/stdout \
-        /var/log/aptcentral/daemon.stdout.log \
-        /var/log/aptcentral/daemon.log &
+    sprinkler $prefix/var/run/aptcentral/stdout \
+        $prefix/var/log/aptcentral/daemon.stdout.log \
+        $prefix/var/log/aptcentral/daemon.log &
 
-    sprinkler /var/run/aptcentral/stderr \
-        /var/log/aptcentral/daemon.stderr.log \
-        /var/log/aptcentral/daemon.log &
+    sprinkler $prefix/var/run/aptcentral/stderr \
+        $prefix/var/log/aptcentral/daemon.stderr.log \
+        $prefix/var/log/aptcentral/daemon.log &
 
     # Now that the sprinklers are set up, we can redirect output to the pipes.
-    exec >/var/run/aptcentral/stdout
-    exec 2>/var/run/aptcentral/stderr
+    exec >$prefix/var/run/aptcentral/stdout
+    exec 2>$prefix/var/run/aptcentral/stderr
 
     # Process commands from the command pipe.
     while true; do
@@ -128,31 +118,37 @@ daemon() {
                 echo "exiting...";
                 break 2 ;; # break out of the outer loop
             install)
-                # TODO: Validate args, stdout_pipe, stderr_pipe. Otherwise we
-                # allow command injection as root. Anyone can send us a
-                # command...
-                # TODO: Oh man there's no way to make this safe.
+                # This is potentially unsafe. It's important that $prefix is a
+                # directory that only the sudoer can cd into. At least then
+                # it's only he who can execute arbitrary code as root this way.
                 >"$stdout_pipe" 2>"$stderr_pipe" apt-get install -y $args
+                >"$status_pipe" printf "$?" ;;
+            remove)
+                # See the note about safety, above.
+                >"$stdout_pipe" 2>"$stderr_pipe" apt-get remove -y $args
                 >"$status_pipe" printf "$?" ;;
             *)
                 echo "aptcentral daemon received invalid command: $command $args" ;;
             esac
-        done </var/run/aptcentral/command
+        done <$prefix/var/run/aptcentral/command
     done
 
     # Remove our pipes.
-    rm /var/run/aptcentral/command
+    rm $prefix/var/run/aptcentral/command
     # Removing the stdout and stderr pipes is a little trickier, because we
     # want to first rm the pipe and then close it to wake up the sprinkler.
     # Since our stdout and stderr are tied to the pipes, that means we have to
     # close our stdout and stderr. Let's redirect them to the output pipes of
     # the "exit" command that got us here.
-    rm /var/run/aptcentral/stdout
+    rm $prefix/var/run/aptcentral/stdout
     exec >"$stdout_pipe"
-    rm /var/run/aptcentral/stderr
+    rm $prefix/var/run/aptcentral/stderr
     exec 2>"$stderr_pipe"
 
     wait # wait for the sprinklers to terminate
+
+    # Make sure anybody can delete the logs
+    chmod 666 $prefix/var/log/aptcentral/*
 
     # Notify the client who sent us "exit" that we're done (zero → success).
     >"$exit_status_pipe" printf "0"
@@ -161,44 +157,47 @@ daemon() {
 start_daemon() {
     # Make sure that we have elevated permissions.
     if [ "$(id -u)" -ne 0 ]; then
-        >&2 echo "aptcentral --start-daemon must run as root, e.g. using sudo"
+        >&2 echo "'aptcentral start' must run as root, e.g. using sudo"
         return 1
     fi
 
+    mkdir --parents $prefix/var/run/aptcentral # for pipes
+    chmod 777 $prefix/var $prefix/var/run $prefix/var/run/aptcentral
+    mkdir --parents $prefix/var/log/aptcentral # for logs
+    chmod 777 $prefix/var $prefix/var/log $prefix/var/log/aptcentral
+
     # If the command pipe is already there, then something is or was wrong.
-    if [ -p /var/run/aptcentral/command ]; then
+    if [ -p $prefix/var/run/aptcentral/command ]; then
         >&2 cat <<-END_ERROR
-		The /var/run/aptcentral/command pipe already exists. Either
-		aptcentral --start-daemon is already running, or a previous instance of
+		The $prefix/var/run/aptcentral/command pipe already exists. Either
+		'aptcentral start' is already running, or a previous instance of
 		the daemon did not remove the pipe before exiting.
 
-		If you're sure that aptcentral --start-daemon is not running, then 'sudo
-		rm /var/run/aptcentral/command' and try again.
+		If you're sure that 'aptcentral start' is not running, then 'sudo
+		rm $prefix/var/run/aptcentral/command' and try again.
 		END_ERROR
         return 2
     fi
 
-    mkdir -p /var/run/aptcentral # for pipes
-    mkdir -p /var/log/aptcentral # for logs
-
     # for communicating with clients
-    mkfifo --mode=666 /var/run/aptcentral/command
+    mkfifo --mode=666 $prefix/var/run/aptcentral/command
 
     # The daemon will redirect its stdout and stderr to these pipes, after
     # first spawning child processes that tee the pipes into various logs.
-    if ! [ -p /var/run/aptcentral/stdout ]; then
-        mkfifo /var/run/aptcentral/stdout # for logging
+    if ! [ -p $prefix/var/run/aptcentral/stdout ]; then
+        mkfifo $prefix/var/run/aptcentral/stdout # for logging
     fi
-    if ! [ -p /var/run/aptcentral/stderr ]; then
-        mkfifo /var/run/aptcentral/stderr # for logging
+    if ! [ -p $prefix/var/run/aptcentral/stderr ]; then
+        mkfifo $prefix/var/run/aptcentral/stderr # for logging
     fi
 
     </dev/null >/dev/null 2>/dev/null daemon &
 }
 
 send_command() {
-    if ! [ -p /var/run/aptcentral/command ]; then
-        >&2 echo "There's no pipe at /var/run/aptcentral/command."
+    if ! [ -p $prefix/var/run/aptcentral/command ]; then
+        >&2 echo "There's no pipe at $prefix/var/run/aptcentral/command."
+        >&2 echo "The aptcentral daemon is probably not running."
         return 1
     fi
 
@@ -208,7 +207,7 @@ send_command() {
     mkfifo $workspace/stderr
     mkfifo $workspace/status
 
-    >/var/run/aptcentral/command echo \
+    >$prefix/var/run/aptcentral/command echo \
         "$workspace/stdout $workspace/stderr $workspace/status $@"
 
     cat $workspace/stdout &
@@ -224,28 +223,71 @@ stop_daemon() {
     send_command exit
 }
 
-install() {
-    send_command install "$@"
+check_prefix() {
+    case "$prefix" in
+    /*) ;; # good, absolute path
+    "")
+        >&2 echo "The --prefix parameter is required (first)."
+        return 1 ;;
+    *)
+        >&2 echo "--prefix must be an absolute path, but \"$prefix\" is not."
+        return 1 ;;
+    esac
+
+    if ! [ -e "$prefix" ]; then
+        >&2 echo "--prefix must exist, but the specified \"$prefix\" does not."
+        return 1
+    fi
+
+    if ! [ -d "$prefix" ]; then
+        >&2 echo "--prefix must be a directory, but the specified \"$prefix\" is not."
+        return 1
+    fi
+
+    # octal file access permissions
+    permissions=$(stat --format=%a "$prefix")
+    if [ "$permissions" != 700 ]; then
+        >&2 echo "--prefix must have permissions mask 700, but $prefix has $permissions."
+        return 1
+    fi
 }
 
-case "$1" in
--h|--help)
-    usage
-    exit ;;
---start-daemon)
-    check_solo_flag_args "$@" || exit
-    start_daemon || exit ;;
---stop-daemon)
-    # TODO: use a different, root-only, pipe for stopping
-    check_solo_flag_args "$@" || exit
-    stop_daemon || exit ;;
-install)
-    check_install_args "$@" || exit
-    shift
-    install "$@" || exit ;;
-*)
-    >&2 usage
-    >&2 echo
-    >&2 echo "Invalid argument(s): $@"
-    exit 1 ;;
-esac
+# Parse command line arguments and run the relevant functions.
+prefix=""
+while true; do
+    case "$1" in
+    -h|--help)
+        usage
+        exit ;;
+    --prefix)
+        prefix="$2"
+        shift 2 ;;
+    start)
+        check_solo_flag_args "$@" || exit
+        check_prefix || exit
+        start_daemon
+        exit ;;
+    stop)
+        check_solo_flag_args "$@" || exit
+        check_prefix || exit
+        stop_daemon
+        exit ;;
+    install)
+        shift
+        check_package_args "$@" || exit
+        check_prefix || exit
+        send_command install "$@"
+        exit ;;
+    remove)
+        shift
+        check_package_args "$@" || exit
+        check_prefix || exit
+        send_command remove "$@"
+        exit ;;
+    *)
+        >&2 usage
+        >&2 echo
+        >&2 echo "Invalid argument(s): $@"
+        exit 1;;
+    esac
+done

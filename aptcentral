@@ -147,9 +147,9 @@ daemon() {
     # close our stdout and stderr. Let's redirect them to the output pipes of
     # the "exit" command that got us here.
     rm $prefix/var/run/aptcentral/stdout
-    exec >"$stdout_pipe"
+    exec >"$exit_stdout_pipe"
     rm $prefix/var/run/aptcentral/stderr
-    exec 2>"$stderr_pipe"
+    exec 2>"$exit_stderr_pipe"
 
     wait # wait for the sprinklers to terminate
 

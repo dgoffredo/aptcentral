@@ -1,5 +1,6 @@
 
-APTCENTRAL := ./aptcentral --prefix $(shell realpath scratch.d)
+# "=" instead of ":=", because "scratch.d/" might not exist yet.
+APTCENTRAL = ./aptcentral --prefix $(shell realpath scratch.d)
 
 # Note: 'try-start' and 'try-stop' commands would be better than this
 # "2>/dev/null || true" hack used below. Then we could distinguish "already
